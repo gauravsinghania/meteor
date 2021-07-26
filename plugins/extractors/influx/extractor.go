@@ -2,6 +2,7 @@ package influx
 
 import (
 	"database/sql"
+	"encoding/json"
 	"fmt"
 
 	_ "github.com/influxdata/influxdb1-client/v2"
@@ -40,133 +41,68 @@ func (e *Extractor) Extract(c map[string]interface{}) (result []meta.Table, err 
 	}
 
 	cli, err := client.NewHTTPClient(client.HTTPConfig{
-		Addr: "http://localhost:8086",
+		Addr: fmt.Sprintf("http://%s", config.Host),
 	})
 	if err != nil {
 		fmt.Println("Error creating InfluxDB Client: ", err.Error())
 	}
 	defer cli.Close()
 
-	q := client.NewQuery("show measurements", config.DatabaseName, "")
-	response, err := cli.Query(q)
+	e.getMeasurements(cli, config.DatabaseName, config.RetentionPolicy, result)
+
+	return
+}
+
+func (e *Extractor) getMeasurements(influxClient client.Client, dbName, retentionPolicy string, r []meta.Table) (result []meta.Table, err error) {
+
+	var tags []string
+	q := client.NewQuery("show measurements", dbName, "")
+	response, err := influxClient.Query(q)
 	if err != nil || response.Error() != nil {
 		return nil, err
 	}
 	for _, value := range response.Results {
-		// fmt.Println(index)
-		// fmt.Println(value)
-		for _, v := range value.Series {
-			for _, names := range v.Values {
+		jsonString, _ := json.MarshalIndent(value, "", "\t")
+		fmt.Println(string(jsonString))
+
+		for _, series := range value.Series {
+			for _, measurements := range series.Values {
+				measurement := (measurements[0]).(string)
+				tags, err = e.getTagkeysForMeasurement(influxClient, dbName, measurement)
+				if err != nil {
+					return
+				}
+				jsonString, _ := json.MarshalIndent(tags, "", "\t")
+				fmt.Println(string(jsonString))
 				result = append(result, meta.Table{
-					Urn:  fmt.Sprintf("%s.%s.%s", config.DatabaseName, config.RetentionPolicy, names[0]),
-					Name: (names[0]).(string),
+					Urn:  fmt.Sprintf("%s.%s.%s", dbName, retentionPolicy, measurements[0]),
+					Name: (measurements[0]).(string),
+					Custom: &facets.Custom{
+						CustomProperties: map[string]string{
+							// tags: tags,
+						},
+					},
 				})
-				// for _, name := range names {
-				// 	fmt.Println(name)
-				// }
 			}
 		}
-		// jsonString, _ := json.Marshal(value)
-		// fmt.Println("Marshal Datasets Result : ", string(jsonString))
-
-		//{0 [{measurements map[] [name] [[measurment1]] false}] [] }
 	}
-
 	return
-	// db, err := sql.Open("postgres", fmt.Sprintf(
-	// 	"postgres://%s:%s@%s/%s?sslmode=disable",
-	// 	config.UserID, config.Password, config.Host, config.DatabaseName))
-	// if err != nil {
-	// 	return
-	// }
-	// defer db.Close()
-
-	// result, err = e.getDatabases(db)
-	// if err != nil {
-	// 	return
-	// }
-
-	// return
 }
 
 func (e *Extractor) getDatabases(db *sql.DB) (result []meta.Table, err error) {
-	res, err := db.Query("SELECT datname FROM pg_database WHERE datistemplate = false;")
-	if err != nil {
-		return
-	}
-	for res.Next() {
-		var database string
-		res.Scan(&database)
-		if checkNotDefaultDatabase(database) {
-			result, err = e.getTablesInfo(db, database, result)
-			if err != nil {
-				return
-			}
-		}
-	}
 	return
 }
 
-func (e *Extractor) getTablesInfo(db *sql.DB, dbName string, result []meta.Table) (_ []meta.Table, err error) {
-	sqlStr := `SELECT table_name
-	FROM information_schema.tables
-	WHERE table_schema = 'public'
-	ORDER BY table_name;`
-	_, err = db.Exec(fmt.Sprintf("SET search_path TO %s, public;", dbName))
-	if err != nil {
-		return
+func (e *Extractor) getTagkeysForMeasurement(influxClient client.Client, dbName, measurement string) (tags []string, err error) {
+	q := client.NewQuery(fmt.Sprintf("show tag keys from \"%s\"", measurement), dbName, "")
+	response, err := influxClient.Query(q)
+	if err != nil || response.Error() != nil {
+		return nil, err
 	}
-	rows, err := db.Query(sqlStr)
-	if err != nil {
-		return
+	for _, value := range response.Results[0].Series[0].Values {
+		tags = append(tags, (value[0]).(string))
 	}
-	for rows.Next() {
-		var tableName string
-		err = rows.Scan(&tableName)
-		if err != nil {
-			return
-		}
-		var columns []*facets.Column
-		columns, err = e.getColumns(db, dbName, tableName)
-		if err != nil {
-			return
-		}
-
-		result = append(result, meta.Table{
-			Urn:  fmt.Sprintf("%s.%s", dbName, tableName),
-			Name: tableName,
-			Schema: &facets.Columns{
-				Columns: columns,
-			},
-		})
-	}
-	return result, err
-}
-
-func (e *Extractor) getColumns(db *sql.DB, dbName string, tableName string) (result []*facets.Column, err error) {
-	sqlStr := `SELECT COLUMN_NAME,DATA_TYPE,
-				IS_NULLABLE,coalesce(CHARACTER_MAXIMUM_LENGTH,0)
-				FROM information_schema.columns
-				WHERE TABLE_NAME = '%s' ORDER BY COLUMN_NAME ASC;`
-	rows, err := db.Query(fmt.Sprintf(sqlStr, tableName))
-	if err != nil {
-		return
-	}
-	for rows.Next() {
-		var fieldName, dataType, isNullableString string
-		var length int
-		err = rows.Scan(&fieldName, &dataType, &isNullableString, &length)
-		if err != nil {
-			return
-		}
-		result = append(result, &facets.Column{
-			Name:       fieldName,
-			DataType:   dataType,
-			IsNullable: e.isNullable(isNullableString),
-			Length:     int64(length),
-		})
-	}
-	return result, nil
+	return tags, nil
 }
 
 func (e *Extractor) isNullable(value string) bool {
